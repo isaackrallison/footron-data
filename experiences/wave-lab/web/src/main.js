@@ -437,9 +437,26 @@ depthBtn.addEventListener('click', () => {
   depthBtn.classList.toggle('on', renderer.showDepth);
   markInput();
 });
+const controlsEl = document.getElementById('controls');
 document.getElementById('collapse').addEventListener('click', () => {
-  document.getElementById('controls').classList.toggle('collapsed');
+  controlsEl.classList.toggle('collapsed');
+  syncScrollHint();
 });
+
+// On a window shorter than the panel the body scrolls inside it, and macOS
+// draws no scrollbar until something has already been scrolled — so without a
+// hint at the bottom edge the panel simply looks as though it ends after the
+// demonstrations, and the weather presets and the button row appear not to
+// exist. The class fades that edge while there is more below it.
+const controlsBody = controlsEl.querySelector('.body');
+function syncScrollHint() {
+  const more = controlsBody.scrollHeight - controlsBody.clientHeight
+    - controlsBody.scrollTop > 4;
+  controlsEl.classList.toggle('scrollable', more);
+}
+controlsBody.addEventListener('scroll', syncScrollHint);
+addEventListener('resize', syncScrollHint);
+syncScrollHint();
 
 function currentPreset() {
   const on = document.querySelector('#presets button.on');
@@ -715,7 +732,13 @@ function frame(now) {
   statTimer -= dt;
   if (statTimer <= 0) {
     statTimer = 0.25;
-    updateReport();
+    // The wall shows the beach and nothing else: every panel is behind the
+    // `hidden` class there, so the surf report is a measurement no one can
+    // read. Keyed on the class rather than on `kiosk` so that `H` — which is
+    // how you get the panels back on the wall machine itself — brings a live
+    // report back with them, and so pressing `H` on a desktop stops the work
+    // too.
+    if (!ui.classList.contains('hidden')) updateReport();
     statsEl.textContent =
       `${fpsAvg.toFixed(0)} fps · ${NX}×${NY} cells\n` +
       `${world.floaters.length} floating · ${world.crabs.length} crabs` +
@@ -737,6 +760,10 @@ for (let i = 0; i < 4; i++) world.addProp(NX * (0.84 + Math.random() * 0.1), Mat
 // line one still answers document.title.
 window.__wavelab = {
   sim, world, renderer,
+  // The picture is a window onto a wider basin, and the checks have to be able
+  // to convert a fraction of the WALL into a grid column the way the phone's
+  // touch handler does. Guessing it from the grid size got it wrong once.
+  VIEW_X0, VIEW_NX,
   get theme() { return themeName; },
   setCoast, setTheme, setMood, rogueWave, runLesson,
   get showFlow() { return showFlow; },
