@@ -355,8 +355,20 @@ export class Renderer {
           }
         } else {
           // ----------------------------------------------------------- sand
-          const bnx = -(bsm[ir] - bsm[il]) * 1.1;
-          const bny = -(bsm[rowp + i] - bsm[rowm + i]) * 1.1;
+          // The exaggeration is the difference between a beach you can sculpt
+          // and one that only looks sculptable. At 1.1 a brush-sized pile is a
+          // slope of about 0.02 per cell, which moves `bshade` by under 1% —
+          // measured on the wall, piling sand on DRY sand raised the bed the
+          // full 0.275 m and moved not one pixel above threshold, while the
+          // phone was telling the visitor the wall was listening to exactly
+          // where their finger went. Wet sand and the shallows get their
+          // contrast from wetness and depth instead, so this term is the only
+          // thing that draws relief above the waterline. At 4.5 the same tap
+          // moves ~18% of the pixels around it, and the undisturbed beach
+          // hardly shifts (mean luminance 209 → 203, sd 9.56 → 9.83) because
+          // the field being differenced is already smoothed twice.
+          const bnx = -(bsm[ir] - bsm[il]) * 4.5;
+          const bny = -(bsm[rowp + i] - bsm[rowm + i]) * 4.5;
           const binv = 1 / Math.sqrt(bnx * bnx + bny * bny + 1);
           let bd = (bnx * LX + bny * LY + LZ) * binv;
           if (bd < 0) bd = 0;
