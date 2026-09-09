@@ -134,11 +134,24 @@ function pickMap(maps, cum) {
   return i;
 }
 
-// Where does this set of maps actually live? Sampled, so bent coefficients
-// still get framed correctly instead of running off the sheet.
+/* Where does this set of maps actually live? Sampled, so bent coefficients
+ * still get framed correctly instead of running off the sheet.
+ *
+ * The walk is also kept, in SAMP: a bounding box says how big the plant is but
+ * not what shape it is, and the shape is what layout() needs to slide the fern
+ * left past the QR card. A fern's box is a near-square whose corners are
+ * empty, so clearing the card by its box would refuse a shift that its ink has
+ * room for several hundred pixels of. */
+const SAMP_MAX = 30000;
+const SAMP_X = new Float32Array(SAMP_MAX);
+const SAMP_Y = new Float32Array(SAMP_MAX);
+let SAMP_N = 0;
+
 function measure(maps, cum, samples) {
+  const n = Math.min(samples || 30000, SAMP_MAX);
   let x = 0, y = 0, xlo = 1e9, xhi = -1e9, ylo = 1e9, yhi = -1e9;
-  for (let i = 0; i < (samples || 30000); i++) {
+  SAMP_N = 0;
+  for (let i = 0; i < n; i++) {
     const m = maps[pickMap(maps, cum)].m;
     const nx = m[0] * x + m[1] * y + m[4];
     y = m[2] * x + m[3] * y + m[5];
@@ -146,6 +159,7 @@ function measure(maps, cum, samples) {
     if (i < 30) continue;
     if (x < xlo) xlo = x; if (x > xhi) xhi = x;
     if (y < ylo) ylo = y; if (y > yhi) yhi = y;
+    SAMP_X[SAMP_N] = x; SAMP_Y[SAMP_N] = y; SAMP_N++;
   }
   const px = (xhi - xlo) * 0.03, py = (yhi - ylo) * 0.02;
   return { xmin: xlo - px, xspan: (xhi - xlo) + 2 * px, ymin: ylo - py, yspan: (yhi - ylo) + 2 * py };
@@ -167,7 +181,7 @@ function measure(maps, cum, samples) {
  */
 
 function allocGrid() {
-  const diag = Math.hypot(W * BAND.w, H * BAND.h) * DPR;
+  const diag = Math.hypot(W * BAND.w, H * BAND.h) * DPR * GROW;
   const gw = Math.max(32, Math.min(1200, Math.round(diag * 0.62)));
   const gh = Math.max(64, Math.min(2000, Math.round(diag)));
   if (gw === F.gw && gh === F.gh) return;
@@ -195,23 +209,86 @@ function allocGrid() {
  * ROT is the tilt, clockwise from upright, so 0 stands the fern up and 90 lays
  * it on its side. */
 const BAND = { top: 0.01, h: 0.98, w: 0.60 };
+
+/* GROW magnifies the fern past the block BAND describes. At 1 the whole
+ * bounding box fits the sheet, which is what the box is for -- but the box is
+ * a near-square around a picture that lies across it as a thin diagonal, so
+ * most of what fits is empty corner. Above 1 the box overhangs the edges and
+ * the corners go off-sheet first; what the sheet keeps is more fern per pixel.
+ * One number, so it is one number to dial back. */
+const GROW = 1.5;
+
+/* The fern does not sit centred any more -- it is pulled towards the left,
+ * which is the side the writing is on, so the picture and the reading are one
+ * block and the right of the sheet opens up behind the legend.
+ *
+ * How far it can go is not a number anyone can pick in advance. Footron's
+ * launcher paints its "Scan to" QR card over the bottom-left corner (README:
+ * a little over 250px, taller than a row of text), and that card is a fixed
+ * size in pixels while the fern scales with the sheet -- so the room in front
+ * of it is worth hundreds of pixels on a 4K wall and almost nothing in a small
+ * window. Worse, the fern's leftmost ink is low, exactly where the card is.
+ *
+ * So layout() measures instead: it walks the plant's own silhouette and slides
+ * it until the ink is about to touch either the card's keep-out or the left
+ * edge, whichever it reaches first. PULL is the fraction of that room to take,
+ * 0 leaving the fern centred and 1 taking all of it. The keep-out applies off
+ * the wall too, where no card is drawn, so a local preview is framed the same
+ * as the wall it is being authored for. */
+const PULL = 1;
+
+/* The card's keep-out, and the air kept in front of it. The pad is doing two
+ * jobs: it is the visible gap between the ink and the card, and it is the
+ * slack for what the silhouette scan cannot see. 30000 samples find the
+ * plant's edge to about 15px -- measured against a full seven-million-point
+ * walk, where the leftmost ink stops creeping outwards well before the draw
+ * ends, the fern's outline being sharp rather than a fading haze. So 32
+ * leaves the ink half a centimetre clear of a card it is measured to miss. */
+const QR = { w: 300, h: 300, pad: 32 };
+const EDGE_PAD = 24;                      // same slack, against the sheet edge
 const ROT = 46;
 const ROT_C = Math.cos(ROT * Math.PI / 180);
 const ROT_S = Math.sin(ROT * Math.PI / 180);
 
+/* How far left the centred fern could slide before its ink touches something.
+ * Runs the sampled silhouette through the same fern-to-screen transform the
+ * composite and the walker use, and takes the tighter of two clearances: the
+ * leftmost ink against the sheet edge, and the leftmost ink *within the band
+ * the QR card occupies* against the card. Called once per reset, after the
+ * rect is centred and before it is moved, over 30k points -- a rounding error
+ * beside the millions the draw itself plots. */
+function pullRoom() {
+  if (!SAMP_N) return 0;
+  const cx = F.rect.x + F.rect.w * 0.5, cy = F.rect.y + F.rect.h * 0.5;
+  const band = H - (QR.h + QR.pad);      // ink below this line has to clear the card
+  let edge = Infinity, card = Infinity;
+  for (let i = 0; i < SAMP_N; i++) {
+    const ox = ((SAMP_X[i] - F.xmin) / F.xspan - 0.5) * F.iw;
+    const oy = (0.5 - (SAMP_Y[i] - F.ymin) / F.yspan) * F.ih;
+    const sx = cx + ox * ROT_C - oy * ROT_S;
+    if (sx >= edge && sx >= card) continue;
+    if (sx < edge) edge = sx;
+    const sy = cy + ox * ROT_S + oy * ROT_C;
+    if (sy > band && sx < card) card = sx;
+  }
+  const room = Math.min(edge - EDGE_PAD, card - (QR.w + QR.pad));
+  return room > 0 ? room : 0;
+}
+
 /* Screen box for the tilted fern, plus the largest sub-rectangle of the grid
  * with the same shape. The fern is still rasterized upright -- only the
  * compositing and the walk overlay know about the tilt -- so this sizes the
- * upright picture (iw x ih) such that its rotated bounding box fits the block.
+ * upright picture (iw x ih) such that its rotated bounding box fits the block,
+ * then multiplies through by GROW, which is what pushes it past the edges.
  * Called on every reset; allocates nothing. */
-function layout() {
+function layout(remeasure) {
   const boxH = H * BAND.h, boxW = W * BAND.w;
   const c = Math.abs(ROT_C), sn = Math.abs(ROT_S);
   // upright, the fern is ih tall and iw = ih * (xspan/yspan) wide
   let ih = 1, iw = F.xspan / F.yspan;
   // ... and tilted it needs this much room, so scale to whichever axis binds
   const bw = iw * c + ih * sn, bh = iw * sn + ih * c;
-  const k = Math.min(boxW / bw, boxH / bh);
+  const k = Math.min(boxW / bw, boxH / bh) * GROW;
   iw *= k; ih *= k;
   F.iw = iw; F.ih = ih;
   F.rect = {
@@ -219,6 +296,13 @@ function layout() {
     y: H * BAND.top + (boxH - bh * k) / 2,
     w: bw * k, h: bh * k,
   };
+  /* Only a full measure moves the fern. A live knob drag resets off 3500
+   * samples rather than 30000, and the extreme of a smaller sample wanders --
+   * enough to shift the picture a few pixels every frame the finger moves,
+   * which reads as the whole plant shivering. The release re-measures the
+   * attractor properly (see onKnob), and that is when the pull is re-taken. */
+  if (remeasure || F.pull === undefined) F.pull = pullRoom() * PULL;
+  F.rect.x -= F.pull;
 
   const aspect = iw / ih;            // buffer is still upright: xspan / yspan
   let fh = F.gh, fw = Math.round(F.gh * aspect);
@@ -380,7 +464,7 @@ function reset(quick) {
   const b = measure(F.maps, F.cum, quick ? 3500 : 30000);
   F.xmin = b.xmin; F.xspan = b.xspan; F.ymin = b.ymin; F.yspan = b.yspan;
 
-  layout();
+  layout(!quick);
   F.drawStart = F.frame + 1;   // every tag below this is from an earlier draw
   F.total = 0; F.per = [0, 0, 0, 0]; F.maxC = 1; F.owed = 0; F.done = false;
   F.x = 0; F.y = 0;
@@ -421,24 +505,24 @@ const TRAIL = 26;
  * body, a gold point in the gold leaflet. It disappeared exactly when it
  * mattered.
  *
- * Red is the only strong hue the four rules do not use, so it cannot be
- * mistaken for any of them and it separates from all four: it is opposite the
- * green body, well clear of the blue and gold leaflets, and dark enough on a
- * burned-out white ridge to still read there. The trail behind it stays
- * rule-coloured, so which rule fired is still readable from the last few beads
- * -- that reading moved one point back rather than being lost.
+ * The trail behind it stays rule-coloured, so which rule fired is still
+ * readable from the last few beads -- that reading moved one point back rather
+ * than being lost.
  *
- * One flat disc, one colour: no halo, no glow, no lit core. Sized against the
- * picture rather than the screen, so it holds its proportion from a laptop to
- * a 4K wall.
+ * One flat disc, one colour: no halo, no glow, no lit core. Its radius is a
+ * multiple of the freshest trail bead's rather than a number of its own, so
+ * "the point" and "where the point has been" are one size relationship with
+ * one place to change it -- and because a bead is already measured against the
+ * picture and not the screen, the dot holds its proportion to the plant from a
+ * laptop to a 4K wall.
  *
  * It does not pulse, flash or otherwise animate in place. The point already
  * moves -- that is the entire thing it does -- and on an ambient piece that is
  * on screen for the length of a session, a bead that also throbs between jumps
  * keeps pulling the eye back to something that has not changed. The jump is the
  * event; the dot just has to be findable when you look. */
-const DOT = [190, 40, 55];
-const DOT_R = 4.2;
+const DOT = [30, 58, 138];
+const DOT_SCALE = 1.6;   // of the newest trail bead
 
 function stepWalk(dt) {
   const w = F.walk;
@@ -488,6 +572,10 @@ function drawWalk() {
     ctx.lineTo(sxOf(b.x, b.y), syOf(b.x, b.y));
     ctx.stroke();
   }
+  // One bead of the trail: 0 is the oldest still on screen, 1 the newest. The
+  // dot is sized off this too, so the two cannot drift apart.
+  const bead = age => unit * (0.7 + 1.9 * age);
+
   // the trail: every bead but the last keeps the colour of the rule that
   // placed it, which is what still says who fired now that nothing is labelled
   for (let k = 0; k < tr.length - 1; k++) {
@@ -495,7 +583,7 @@ function drawWalk() {
     const p = tr[k], c = F.maps[p.mi].rgb;
     ctx.fillStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + (0.10 + 0.75 * age * age).toFixed(3) + ')';
     ctx.beginPath();
-    ctx.arc(sxOf(p.x, p.y), syOf(p.x, p.y), unit * (0.7 + 1.9 * age), 0, Math.PI * 2);
+    ctx.arc(sxOf(p.x, p.y), syOf(p.x, p.y), bead(age), 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -504,7 +592,7 @@ function drawWalk() {
   const hx = sxOf(h.x, h.y), hy = syOf(h.x, h.y);
   ctx.fillStyle = 'rgb(' + DOT.join(',') + ')';
   ctx.beginPath();
-  ctx.arc(hx, hy, unit * DOT_R, 0, Math.PI * 2);
+  ctx.arc(hx, hy, bead(1) * DOT_SCALE, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.restore();

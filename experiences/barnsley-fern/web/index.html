@@ -18,6 +18,9 @@
     --left: #56c8eb;
     --right: #f2b746;
     --line: rgba(226, 236, 229, 0.20);
+    /* One gutter for everything anchored to an edge, so the title and the
+       narration under it line up on the same rule down the left. */
+    --gutter: clamp(20px, 3vw, 64px);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; overflow: hidden; background: var(--bg); }
@@ -41,7 +44,7 @@
      top-right, the narration down the left side, and the four maps bottom-
      right. BAND in app.js sizes the picture so the ink stays clear of these. */
   #title {
-    left: clamp(20px, 3vw, 64px);
+    left: var(--gutter);
     top: clamp(20px, 3.2vh, 56px);
     width: min(26vw, 480px);
   }
@@ -75,12 +78,18 @@
      larger and looser than anything else here, and it is the copy that gets
      the width rather than the fern. */
   #narrate {
-    left: clamp(20px, 3vw, 64px);
+    /* The panel hangs a padding-width further left than the gutter so that
+       the *text* starts on the gutter -- flush with the title above it, which
+       has no panel to inset it. Aligning the boxes instead of the type would
+       leave the narration visibly indented from the piece's own name. The
+       width gains that padding back, so the measure is unchanged. */
+    --pad-x: clamp(18px, 1.6vw, 32px);
+    left: calc(var(--gutter) - var(--pad-x));
     top: 50%;
     transform: translateY(-50%);
-    width: min(25vw, 480px);
+    width: calc(min(25vw, 480px) + var(--pad-x));
     max-height: 56vh;
-    padding: clamp(16px, 1.4vw, 28px) clamp(18px, 1.6vw, 32px);
+    padding: clamp(16px, 1.4vw, 28px) var(--pad-x);
     border-radius: 12px;
     background: rgba(8, 11, 9, 0.42);
     backdrop-filter: blur(7px);
