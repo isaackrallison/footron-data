@@ -421,24 +421,24 @@ const TRAIL = 26;
  * body, a gold point in the gold leaflet. It disappeared exactly when it
  * mattered.
  *
- * Red is the only strong hue the four rules do not use, so it cannot be
- * mistaken for any of them and it separates from all four: it is opposite the
- * green body, well clear of the blue and gold leaflets, and dark enough on a
- * burned-out white ridge to still read there. The trail behind it stays
- * rule-coloured, so which rule fired is still readable from the last few beads
- * -- that reading moved one point back rather than being lost.
+ * The trail behind it stays rule-coloured, so which rule fired is still
+ * readable from the last few beads -- that reading moved one point back rather
+ * than being lost.
  *
- * One flat disc, one colour: no halo, no glow, no lit core. Sized against the
- * picture rather than the screen, so it holds its proportion from a laptop to
- * a 4K wall.
+ * One flat disc, one colour: no halo, no glow, no lit core. Its radius is a
+ * multiple of the freshest trail bead's rather than a number of its own, so
+ * "the point" and "where the point has been" are one size relationship with
+ * one place to change it -- and because a bead is already measured against the
+ * picture and not the screen, the dot holds its proportion to the plant from a
+ * laptop to a 4K wall.
  *
  * It does not pulse, flash or otherwise animate in place. The point already
  * moves -- that is the entire thing it does -- and on an ambient piece that is
  * on screen for the length of a session, a bead that also throbs between jumps
  * keeps pulling the eye back to something that has not changed. The jump is the
  * event; the dot just has to be findable when you look. */
-const DOT = [190, 40, 55];
-const DOT_R = 4.2;
+const DOT = [30, 58, 138];
+const DOT_SCALE = 1.6;   // of the newest trail bead
 
 function stepWalk(dt) {
   const w = F.walk;
@@ -488,6 +488,10 @@ function drawWalk() {
     ctx.lineTo(sxOf(b.x, b.y), syOf(b.x, b.y));
     ctx.stroke();
   }
+  // One bead of the trail: 0 is the oldest still on screen, 1 the newest. The
+  // dot is sized off this too, so the two cannot drift apart.
+  const bead = age => unit * (0.7 + 1.9 * age);
+
   // the trail: every bead but the last keeps the colour of the rule that
   // placed it, which is what still says who fired now that nothing is labelled
   for (let k = 0; k < tr.length - 1; k++) {
@@ -495,7 +499,7 @@ function drawWalk() {
     const p = tr[k], c = F.maps[p.mi].rgb;
     ctx.fillStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + (0.10 + 0.75 * age * age).toFixed(3) + ')';
     ctx.beginPath();
-    ctx.arc(sxOf(p.x, p.y), syOf(p.x, p.y), unit * (0.7 + 1.9 * age), 0, Math.PI * 2);
+    ctx.arc(sxOf(p.x, p.y), syOf(p.x, p.y), bead(age), 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -504,7 +508,7 @@ function drawWalk() {
   const hx = sxOf(h.x, h.y), hy = syOf(h.x, h.y);
   ctx.fillStyle = 'rgb(' + DOT.join(',') + ')';
   ctx.beginPath();
-  ctx.arc(hx, hy, unit * DOT_R, 0, Math.PI * 2);
+  ctx.arc(hx, hy, bead(1) * DOT_SCALE, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.restore();
