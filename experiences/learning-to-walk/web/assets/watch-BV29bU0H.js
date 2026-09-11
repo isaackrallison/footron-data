@@ -29515,7 +29515,12 @@ const EVO_CONFIG = {
   // experiment, and the bench measures experiments one flag at a time against these baselines. See
   // nextGeneration for what it does, and src/watch/config.js for the run that motivated it.
   exclusiveOperators: false,
+  dedupeChildren: false,
+  // see HUMANOID_EVO_CONFIG; off by default on both creatures
   mutationSigma: 0.2,
+  // Fraction of genes a mutation touches. 1 = all of them, which is what both baselines do and what
+  // the bench has always measured. See mutateBlocked, and src/watch/config.js for the wall.
+  mutationRate: 1,
   mutationSigmaScale: null,
   // see HUMANOID_EVO_CONFIG; off by default on both creatures
   initSigma: 0.3,
@@ -29664,9 +29669,9 @@ const HUMANOID_EVO_CONFIG = {
   // TRADEOFF: forecloses asymmetric gaits -- limping, and turning. For a walk-straight-forward
   // objective that is a feature, but it is why this is a flag and not a rewrite.
   symmetric: true,
-  populationSize: 200,
+  populationSize: 50,
   // genomes per generation
-  batchSize: 30,
+  batchSize: 25,
   // bots evaluated simultaneously = robots in the arena
   trialSeconds: 10,
   // hard cap on one bot's life
@@ -29728,7 +29733,32 @@ const HUMANOID_EVO_CONFIG = {
   // this baseline. Turned on for the wall -- see src/watch/config.js for the measurement behind that,
   // and nextGeneration for the branch itself.
   exclusiveOperators: false,
+  // Reject a bred child that is a genome the run has ALREADY SEEN -- not merely one already in this
+  // generation, but any genome bred since the population was last reset. See nextGeneration for the
+  // retry, and EvolutionRunner for the archive.
+  //
+  // WHY IT IS NEEDED, and why it pairs with the flag above. Under exclusiveOperators a crossed child
+  // gets no mutation, so two identical parents produce a child identical to both. Once the elite
+  // block holds copies of one gait, those copies win most tournaments, cross with themselves, and --
+  // evaluation being deterministic at startJitterRad 0 -- score identically and re-enter the elite
+  // block. Measured on a walker-seeded population at sigma 0.028: 28% of crossover children were
+  // distinct genomes, the elite block held about 1.4, and best moved 6.66 -> 6.76 in twelve
+  // generations. Mutation children were 100% distinct and scored too low to ever displace a clone,
+  // so the search manufactured novelty every generation and discarded all of it.
+  //
+  // PAST GENERATIONS, not just this one: a clone lineage needs only ONE copy per generation to sit in
+  // the elite block forever, which a within-generation check would never see.
+  //
+  // EXACT BYTES. A mutated child is never byte-identical to anything, so this only ever fires on the
+  // crossover half -- with exclusiveOperators off it is a no-op by construction. That is inherent to
+  // exact matching, not an oversight: the failure it targets produces byte-identical genomes.
+  dedupeChildren: false,
   mutationSigma: 0.2,
+  // Fraction of genes a mutation touches, 1 being all of them. One here, because that is what every
+  // number the bench has ever recorded was measured under, and the gate is written to draw no rng at
+  // rate 1 so this stays bit-identical rather than merely equivalent. The wall turns it down -- see
+  // src/watch/config.js for the arithmetic that made it necessary.
+  mutationRate: 1,
   // Per-role mutation step scaling: sigma for gene role r is mutationSigma * mutationSigmaScale[r].
   // null = one uniform sigma for every gene, which is the pre-change behaviour and the baseline this
   // is measured against. Set it to CPG_SIGMA_SCALE to enable (the GUI checkbox does exactly that).
@@ -30489,13 +30519,21 @@ function twoPointBlockCrossover(a2, b, rng, head = 0, block = 1) {
   }
   return child;
 }
+const MEASURED_HEAD_SCALE = [0.13, 0.17];
 function cpgSigmaScale(head) {
-  const optional = new Array(Math.max(0, head - CPG_HEAD)).fill(1);
-  return [0.25, ...optional, 1, 1, 0.75, 0.75, 0.75];
+  const optional = Array.from(
+    { length: Math.max(0, head - CPG_HEAD) },
+    (_, i2) => MEASURED_HEAD_SCALE[i2] ?? 1
+  );
+  return [0.05, ...optional, 0.29, 0.11, 1.33, 3.06, 2.86];
 }
-cpgSigmaScale(CPG_HEAD);
-function mutateBlocked(genome, sigma, scale, clip, rng, head, block) {
+const CPG_SIGMA_SCALE = cpgSigmaScale(CPG_HEAD);
+function mutateBlocked(genome, sigma, scale, clip, rng, head, block, rate = 1) {
+  const gated = rate < 1;
   for (let i2 = 0; i2 < genome.length; i2++) {
+    if (gated && rng() >= rate) {
+      continue;
+    }
     const role = i2 < head ? i2 : head + (i2 - head) % block;
     const s2 = scale && role < scale.length ? sigma * scale[role] : sigma;
     let v = genome[i2] + gaussian(rng) * s2;
@@ -30549,15 +30587,32 @@ function populationDiversity(population, sampleSize = 30) {
   }
   return pairs > 0 ? sum / pairs : 0;
 }
-function nextGeneration(population, fitnesses, cfg, rng, codec = null) {
+const ORIGIN = {
+  COPY: "copy",
+  CROSSOVER: "crossover",
+  MUTATION: "mutation"
+};
+const DEDUPE_RETRIES = 4;
+function genomeKey(genome) {
+  return Array.prototype.join.call(genome, ",");
+}
+function nextGeneration(population, fitnesses, cfg, rng, codec = null, seen2 = null) {
   const ranking = population.map((_, i2) => i2).sort((x, y) => fitnesses[y] - fitnesses[x]);
   const layout = codec && codec.size === (population.length ? population[0].length : 0) ? codec : genomeBlockLayout(cfg.control, population.length ? population[0].length : 0);
   const crossover = cfg.crossoverOp === "twoPoint" ? twoPointBlockCrossover : blockCrossover;
   const poolSize = Math.max(2, Math.floor(population.length * cfg.truncationFraction));
   const pickParent = cfg.selection === "truncation" ? () => population[truncationSelect(ranking, poolSize, rng)] : () => population[tournamentSelect(fitnesses, cfg.tournamentSize, rng)];
+  const archive = cfg.dedupeChildren && seen2 ? seen2 : null;
+  let duplicates = 0;
   const next = [];
+  const origins = [];
   for (let e2 = 0; e2 < Math.min(cfg.eliteCount, population.length); e2++) {
-    next.push(population[ranking[e2]].slice());
+    const elite = population[ranking[e2]].slice();
+    if (archive) {
+      archive.add(genomeKey(elite));
+    }
+    next.push(elite);
+    origins.push(ORIGIN.COPY);
   }
   const mutate = (g2) => mutateBlocked(
     g2,
@@ -30566,19 +30621,43 @@ function nextGeneration(population, fitnesses, cfg, rng, codec = null) {
     cfg.weightClip,
     rng,
     layout.head,
-    layout.block
+    layout.block,
+    cfg.mutationRate === void 0 ? 1 : cfg.mutationRate
   );
+  const deduped = (child) => {
+    if (!archive) {
+      return child;
+    }
+    let key = genomeKey(child);
+    if (archive.has(key)) {
+      duplicates++;
+      for (let t2 = 0; t2 < DEDUPE_RETRIES && archive.has(key); t2++) {
+        mutate(child);
+        key = genomeKey(child);
+      }
+      if (archive.has(key)) {
+        child = randomGenome(rng, cfg.initSigma, child.length);
+        key = genomeKey(child);
+      }
+    }
+    archive.add(key);
+    return child;
+  };
   while (next.length < population.length) {
     const a2 = pickParent();
     const b = pickParent();
     if (cfg.exclusiveOperators) {
-      next.push(rng() < cfg.crossoverRate ? crossover(a2, b, rng, layout.head, layout.block) : mutate(a2.slice()));
+      const crossed = rng() < cfg.crossoverRate;
+      next.push(deduped(crossed ? crossover(a2, b, rng, layout.head, layout.block) : mutate(a2.slice())));
+      origins.push(crossed ? ORIGIN.CROSSOVER : ORIGIN.MUTATION);
     } else {
-      const child = rng() < cfg.crossoverRate ? crossover(a2, b, rng, layout.head, layout.block) : a2.slice();
-      next.push(mutate(child));
+      const crossed = rng() < cfg.crossoverRate;
+      const child = crossed ? crossover(a2, b, rng, layout.head, layout.block) : a2.slice();
+      next.push(deduped(mutate(child)));
+      origins.push(crossed ? ORIGIN.CROSSOVER : ORIGIN.MUTATION);
     }
   }
-  return { population: next, ranking };
+  return { population: next, ranking, origins, duplicates };
 }
 function buildObservation(r2, qpos, qvel, jointMap, out, nAct = ACTUATORS_PER_ROBOT) {
   const a2 = r2.qposAdr, v = r2.qvelAdr;
@@ -31016,6 +31095,11 @@ class EvolutionRunner {
     this.facings = new Float64Array(this.cfg.populationSize).fill(NaN);
     this.ctrlCosts = new Float64Array(this.cfg.populationSize).fill(NaN);
     this.contactCosts = new Float64Array(this.cfg.populationSize).fill(NaN);
+    this.origins = new Array(this.cfg.populationSize).fill(null);
+    this.originsVersion = 0;
+    this.trialVersion = 0;
+    this.seenGenomes = new Set(this.population.map(genomeKey));
+    this.duplicates = 0;
     this.generation = 0;
     this.batchIndex = 0;
     this.trialIndex = 0;
@@ -31102,6 +31186,9 @@ class EvolutionRunner {
       }
       const slot = !spread || slots < 2 ? i2 : Math.round(i2 * (this.cfg.populationSize - 1) / (slots - 1));
       this.population[slot] = g2;
+      if (this.seenGenomes) {
+        this.seenGenomes.add(genomeKey(g2));
+      }
       this.scores[slot] = this.survivals[slot] = this.distances[slot] = this.facings[slot] = NaN;
       this.roams[slot] = this.strides[slot] = this.speeds[slot] = NaN;
       this.ctrlCosts[slot] = this.contactCosts[slot] = NaN;
@@ -31160,12 +31247,14 @@ class EvolutionRunner {
         break;
       }
       this.population[i2] = this.pendingSeeds.shift();
+      this.origins[i2] = ORIGIN.COPY;
       this.scores[i2] = this.survivals[i2] = this.distances[i2] = this.facings[i2] = NaN;
       this.roams[i2] = this.strides[i2] = this.speeds[i2] = NaN;
       this.ctrlCosts[i2] = this.contactCosts[i2] = NaN;
       seeded.push(i2);
     }
     if (seeded.length > 0) {
+      this.originsVersion++;
       this.seedInfo = `seeded slot(s) ${seeded.reverse().join(", ")} in generation ${this.generation}` + (this.pendingSeeds.length ? `, ${this.pendingSeeds.length} still waiting` : "");
     }
   }
@@ -31341,6 +31430,7 @@ class EvolutionRunner {
       this._applyPendingSeeds();
       this._zeroTrialSums();
     }
+    this.trialVersion++;
     this.pendingReset = false;
   }
   /** Perturbs the freshly reset pose for this trial, and picks the oscillator's start phase.
@@ -31481,7 +31571,14 @@ class EvolutionRunner {
       return;
     }
     const fitnesses = Array.from(this.scores);
-    const bred = nextGeneration(this.population, fitnesses, this.cfg, this.rng, this.codec);
+    const bred = nextGeneration(
+      this.population,
+      fitnesses,
+      this.cfg,
+      this.rng,
+      this.codec,
+      this.seenGenomes
+    );
     this.lastScores = Float64Array.from(this.scores);
     this.lastSurvivals = Float64Array.from(this.survivals);
     this.lastDistances = Float64Array.from(this.distances);
@@ -31493,6 +31590,9 @@ class EvolutionRunner {
     this.lastContactCosts = Float64Array.from(this.contactCosts);
     this.lastRanking = bred.ranking;
     this.population = bred.population;
+    this.origins = bred.origins;
+    this.originsVersion++;
+    this.duplicates = bred.duplicates;
     this._refreshDiagnostics();
     this.scores.fill(NaN);
     this.survivals.fill(NaN);
@@ -31681,7 +31781,12 @@ class EvolutionRunner {
       // GUI, and populationDiversity is O(sample^2 * genomeLength) -- ~135k float ops for Cassie,
       // which is not worth paying 60 times a second for a number that changes once a generation.
       saturated: this.saturated,
-      diversity: this.diversity
+      diversity: this.diversity,
+      // Children cfg.dedupeChildren replaced last generation, and how many genomes it is checking
+      // against. Without these the experiment's claim is unobservable from the GUI -- you cannot tell
+      // a flag that is finding nothing from one that is not running.
+      duplicates: this.duplicates,
+      archived: this.seenGenomes ? this.seenGenomes.size : 0
     };
   }
 }
@@ -32304,6 +32409,73 @@ function setupManualCpgGUI(parentContext) {
   show(parentContext.params.scene);
   return manual;
 }
+const ORIGIN_COLOR = {
+  [ORIGIN.COPY]: 15765820,
+  [ORIGIN.CROSSOVER]: 14702411,
+  [ORIGIN.MUTATION]: 5215206
+};
+const ORIGIN_LABEL = {
+  [ORIGIN.COPY]: "carried over unchanged",
+  [ORIGIN.CROSSOVER]: "bred from two parents",
+  [ORIGIN.MUTATION]: "a copy, changed at random"
+};
+function mapBodiesToRobots(model, robots) {
+  const owner = new Int32Array(model.nbody).fill(-1);
+  const rootOf = /* @__PURE__ */ new Map();
+  robots.forEach((r2, slot) => rootOf.set(r2.rootBodyId, slot));
+  for (let b = 1; b < model.nbody; b++) {
+    let cur = b;
+    for (let hops = 0; cur > 0 && hops < 256; hops++) {
+      const slot = rootOf.get(cur);
+      if (slot !== void 0) {
+        owner[b] = slot;
+        break;
+      }
+      cur = model.body_parentid[cur];
+    }
+  }
+  return owner;
+}
+function createTinter(demo2, robots, model) {
+  const owner = mapBodiesToRobots(model, robots);
+  const painted = [];
+  for (let b = 1; b < model.nbody; b++) {
+    const slot = owner[b];
+    const group = demo2.bodies ? demo2.bodies[b] : null;
+    if (slot < 0 || !group || !group.children) {
+      continue;
+    }
+    for (const child of group.children) {
+      if (!child || !child.isMesh) {
+        continue;
+      }
+      const colour = child.material && child.material.color;
+      if (!colour || typeof colour.getHex !== "function") {
+        continue;
+      }
+      painted.push({ colour, base: colour.getHex(), slot });
+    }
+  }
+  const apply = (runner2) => {
+    if (!runner2) {
+      return;
+    }
+    const members = runner2.members;
+    const origins = runner2.origins;
+    for (const p2 of painted) {
+      const genome = members ? members[p2.slot] : p2.slot;
+      const origin = origins && genome !== void 0 ? origins[genome] : null;
+      const hex = ORIGIN_COLOR[origin];
+      p2.colour.setHex(hex === void 0 ? p2.base : hex);
+    }
+  };
+  const reset = () => {
+    for (const p2 of painted) {
+      p2.colour.setHex(p2.base);
+    }
+  };
+  return { apply, reset, painted };
+}
 const isAnyEvolutionScene = (scene) => isEvolutionScene(scene) || isHumanoidEvolutionScene(scene);
 const isGeneratedScene = (scene) => isGeneratedCassieScene(scene) || isHumanoidEvolutionScene(scene) || isHumanoidManualScene(scene);
 async function reloadFunc() {
@@ -32392,9 +32564,11 @@ function setupEvolutionGUI(parentContext) {
   params2.evoGenome = 0;
   params2.evoSaturated = "0%";
   params2.evoDiversity = "0.00";
+  params2.evoDuplicates = "0";
   params2.evoSeed = "";
   params2.evoSeedStatus = "";
   params2.evoPerRoleSigma = false;
+  params2.evoColourLineage = false;
   params2.evoSymmetric = false;
   params2.evoPhaseReset = false;
   params2.evoLeanStep = false;
@@ -32427,6 +32601,24 @@ function setupEvolutionGUI(parentContext) {
     runner2.reset();
     syncReadouts();
   } }, "restart").name("Restart population");
+  let tinter2 = null;
+  let paintedOrigins2 = -1;
+  let paintedTrial2 = -1;
+  const rebuildTinter = () => {
+    tinter2 = parentContext.model && parentContext.robots && parentContext.robots.length ? createTinter(parentContext, parentContext.robots, parentContext.model) : null;
+    paintedOrigins2 = -1;
+    paintedTrial2 = -1;
+  };
+  folder.add(params2, "evoColourLineage").name("Colour by lineage").onChange((on) => {
+    if (!tinter2) {
+      rebuildTinter();
+    }
+    if (!on && tinter2) {
+      tinter2.reset();
+    }
+    paintedOrigins2 = -1;
+  });
+  folder.add({ key: Object.values(ORIGIN_LABEL).join(" | ") }, "key").name("orange | red | blue").disable();
   const experiments = folder.addFolder("Experiments");
   const restartForShape = () => {
     runner2.onModelReloaded(parentContext.model, parentContext.data, parentContext.robots);
@@ -32488,9 +32680,13 @@ function setupEvolutionGUI(parentContext) {
     runner2.cfg.mutationSigmaScale = on ? cpgSigmaScale(runner2.codec ? runner2.codec.head : CPG_HEAD) : null;
   });
   experiments.add(runner2.cfg, "crossoverOp", ["uniform", "twoPoint"]).name("Crossover");
+  experiments.add(runner2.cfg, "exclusiveOperators").name("Crossover OR mutation");
+  experiments.add(runner2.cfg, "dedupeChildren").name("Duplicate elimination");
+  experiments.add(runner2.cfg, "mutationRate", 0.05, 1, 0.05).name("Genes mutated");
   experiments.add(runner2.cfg, "trialsPerGenome", 1, 5, 1).name("Trials / genome");
   experiments.add(runner2.cfg, "startJitterRad", 0, 0.2, 0.01).name("Start jitter (rad)");
   experiments.add(runner2.cfg, "startJitterPhase").name("Jitter start phase");
+  experiments.add(runner2.cfg, "settleSeconds", 0, 3, 0.25).name("Settle after fall (s)").onFinishChange(() => runner2.syncTrialSteps());
   experiments.close();
   const seedFromText = (text) => {
     try {
@@ -32539,8 +32735,21 @@ function setupEvolutionGUI(parentContext) {
   folder.add(params2, "evoGenome").name("Genes").listen().disable();
   folder.add(params2, "evoSaturated").name("Saturated").listen().disable();
   folder.add(params2, "evoDiversity").name("Diversity").listen().disable();
+  folder.add(params2, "evoDuplicates").name("Duplicates").listen().disable();
   folder.add(params2, "evoSeedStatus").name("Seed status").listen().disable();
   function syncReadouts() {
+    if (params2.evoColourLineage) {
+      if (!tinter2) {
+        rebuildTinter();
+      }
+      if (tinter2 && runner2.trialVersion !== paintedTrial2) {
+        paintedTrial2 = runner2.trialVersion;
+        if (runner2.originsVersion !== paintedOrigins2) {
+          paintedOrigins2 = runner2.originsVersion;
+          tinter2.apply(runner2);
+        }
+      }
+    }
     const s2 = runner2.stats;
     params2.evoGeneration = s2.generation;
     params2.evoBest = s2.best.toFixed(2);
@@ -32563,6 +32772,7 @@ function setupEvolutionGUI(parentContext) {
     params2.evoGenome = s2.genomeSize;
     params2.evoSaturated = (s2.saturated * 100).toFixed(1) + "%";
     params2.evoDiversity = s2.diversity.toFixed(2);
+    params2.evoDuplicates = s2.duplicates + " / " + s2.archived;
     params2.evoSeedStatus = runner2.seedInfo;
   }
   parentContext.evolutionSync = syncReadouts;
@@ -32583,6 +32793,7 @@ function setupEvolutionGUI(parentContext) {
       params2.evoFadeIn = runner2.cfg.cpg && runner2.cfg.cpg.fadeInSeconds || 0;
       params2.evoStridePenalty = runner2.cfg.strideWeight > 0;
       params2.evoPerRoleSigma = runner2.cfg.mutationSigmaScale !== null;
+      rebuildTinter();
       folder.controllersRecursive().forEach((c2) => c2.updateDisplay());
       syncReadouts();
     } else {
@@ -40574,6 +40785,38 @@ const WALL_EVO_CONFIG = {
   // On for the wall only -- the lab baselines stay off so the bench can still measure against them.
   // Note this DOES change what tools/harvest.mjs searches, since harvest imports this config.
   exclusiveOperators: true,
+  // A MUTATION SHOULD BE A NUDGE, NOT A RESAMPLE. The baseline perturbs every gene, every time, at
+  // sigma 0.2. On this 38-gene genome that moves a genome 1.23 in L2 against a typical length of
+  // 1.85 -- about 67% of itself, so roughly two mutations random-walk a full genome length away and
+  // a gait cannot survive being bred from. That is the mechanism behind the thing measured above:
+  // injected walkers held by the elite block while not one descendant ever reached their band.
+  //
+  // Two knobs, deliberately independent -- rate is how many genes move, sigma is how far each moves:
+  //
+  //   rate 1.0  sigma 0.20   38.0 genes   L2 1.23   67% of genome   <- the baseline
+  //   rate 0.1  sigma 0.20    3.8 genes   L2 0.39   21%
+  //   rate 0.1  sigma 0.10    3.8 genes   L2 0.20   11%
+  //   rate 0.1  sigma 0.05    3.8 genes   L2 0.10    5%
+  //   rate 0.1  sigma 0.01    3.8 genes   L2 0.02    1%              <- here
+  //
+  // Walked down by eye, against the arena: 0.10 was still visibly too hot, then 0.05, and this is
+  // where it settled. One per cent of genome length is a fine-tuning step -- mutation is no longer
+  // the exhibit's source of new material, crossover is, and mutation only polishes what crossover
+  // recombines. If the population ever looks STUCK rather than merely calm, this is the first number
+  // to raise again. Untested at this value: it was set from watching, not from a probe.
+  //
+  // Touching a tenth of the genes also matches what the deck already tells a visitor mutation is --
+  // a copying error in DNA, which changes a few things rather than everything.
+  mutationRate: 0.1,
+  mutationSigma: 0.01,
+  // PER-ROLE STEP SIZES, measured -- see cpgSigmaScale, which is where the numbers and the method
+  // live. Set to CPG_SIGMA_SCALE only to switch the feature ON: onModelReloaded replaces whatever is
+  // here with cpgSigmaScale(codec.head), because a head gene's role is its own index and an array
+  // built for one head size mis-scales every joint gene at another. This config cannot know the head
+  // -- it is derived from the compiled model -- so the value here is a flag, not data.
+  //
+  // The baselines keep null and are therefore untouched by any of this: uniform sigma, bit-identical.
+  mutationSigmaScale: CPG_SIGMA_SCALE,
   // LET THE FALL FINISH BEFORE THE NEXT GENERATION STARTS. A trial ends when every pelvis is below
   // fallHeight, which for this creature is 0.8 m against a standing torso of about 1.28 m -- barely a
   // stumble. Without this the arena resets on that same step, so sixteen bodies are teleported back
@@ -40605,9 +40848,9 @@ const WALL_EVO_CONFIG = {
   settleSeconds: 2
 };
 const INJECTION_STAGES = [
-  { tier: "stand", generation: 10, count: 9 },
-  { tier: "shuffle", generation: 30, count: 9 },
-  { tier: "walk", generation: 55, count: 9 }
+  { tier: "stand", generation: 10, count: 1 },
+  { tier: "shuffle", generation: 30, count: 1 },
+  { tier: "walk", generation: 55, count: 1 }
 ];
 function createInjector(runner2, stages, note = "", schedule = INJECTION_STAGES) {
   const bands = stages || {};
@@ -41109,8 +41352,18 @@ const STYLE = `
   line-height: 1.45; color: #b9c9e4;
 }
 
-#hud .stats {
+/* The top-right column: the live stats, with the colour key stacked underneath.
+   ONE positioned container holding both in normal flow, rather than two independently absolute
+   blocks. The legend used to carry its own top offset, a guess at how tall the stats are -- and
+   it was wrong, so the key printed straight through "Getting somewhere" and "Still standing".
+   Stacking removes the guess: nothing here can overlap whatever the viewport does to the font
+   clamps, and adding or removing a stat row cannot break it either. */
+#hud .readouts {
   position: absolute; right: clamp(24px, 2.2vw, 60px); top: clamp(20px, 2vw, 52px);
+  display: grid; justify-items: end; gap: clamp(16px, 1.8vw, 44px);
+}
+#hud .stats {
+  margin: 0;
   display: grid; grid-template-columns: auto auto; gap: clamp(4px, 0.45vw, 12px) clamp(14px, 1.4vw, 38px);
   align-items: baseline; justify-items: end;
 }
@@ -41123,6 +41376,21 @@ const STYLE = `
   font-variant-numeric: tabular-nums;
 }
 #hud .stats dd.lead { font-size: clamp(30px, 2.6vw, 72px); }
+/* The key for the body colours. Under the stats because it is a readout about the arena rather than
+   an explanation of the idea -- the deck in the top-left is deliberately general and says nothing
+   about this wall. Unbacked text like the rest of the HUD, and small: it is a reference a visitor
+   glances at once, not something to read. */
+#hud .legend {
+  display: grid; gap: clamp(3px, 0.35vw, 9px); justify-items: end;
+}
+#hud .legend .item { display: flex; align-items: center; gap: clamp(6px, 0.6vw, 14px); }
+#hud .legend .label {
+  font-size: clamp(11px, 0.78vw, 21px); color: #93a7c6; letter-spacing: 0.02em;
+}
+#hud .legend .swatch {
+  width: clamp(9px, 0.7vw, 19px); height: clamp(9px, 0.7vw, 19px);
+  border-radius: 50%; flex: none;
+}
 
 /* Bottom-RIGHT: the bottom-left corner belongs to the launcher's QR card. */
 #hud .foot {
@@ -41170,7 +41438,10 @@ class Hud {
         <h1>Learning to Walk</h1>
         <div class="deck"></div>
       </div>
-      <dl class="stats"></dl>
+      <div class="readouts">
+        <dl class="stats"></dl>
+        <div class="legend"></div>
+      </div>
       <div class="foot">
         <div class="badge hidden"></div>
       </div>`;
@@ -41194,6 +41465,19 @@ class Hud {
     this.holding = false;
     this.phaseAt = 0;
     this.pending = null;
+    const legend = root.querySelector(".legend");
+    for (const origin of Object.keys(ORIGIN_LABEL)) {
+      const item = document.createElement("div");
+      item.className = "item";
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = "#" + ORIGIN_COLOR[origin].toString(16).padStart(6, "0");
+      const label = document.createElement("span");
+      label.className = "label";
+      label.textContent = ORIGIN_LABEL[origin];
+      item.append(swatch, label);
+      legend.appendChild(item);
+    }
     const stats = root.querySelector(".stats");
     this.el = {
       generation: row(stats, "Generation", true),
@@ -41438,6 +41722,9 @@ world.onModelReloaded(demo.model, demo.robots);
 const camera = new WallCamera(demo);
 camera.fitTo(demo.gridLayout);
 const hud = new Hud(showHud);
+const tinter = createTinter(demo, demo.robots, demo.model);
+let paintedOrigins = -1;
+let paintedTrial = -1;
 console.info("[learning-to-walk] " + seedNote);
 demo.params.speed = DEFAULT_SPEED;
 const restartCycle = () => {
@@ -41468,6 +41755,13 @@ demo.evolutionSync = () => {
   const arrival = injector.tick();
   if (arrival) {
     hud.announceArrival(arrival.seeded, arrival.tier);
+  }
+  if (runner.trialVersion !== paintedTrial) {
+    paintedTrial = runner.trialVersion;
+    if (runner.originsVersion !== paintedOrigins) {
+      paintedOrigins = runner.originsVersion;
+      tinter.apply(runner);
+    }
   }
   cycleSeconds += dt;
   if (cycleSeconds >= CYCLE_SECONDS && controller.idleSeconds() >= CYCLE_QUIET_SECONDS) {
